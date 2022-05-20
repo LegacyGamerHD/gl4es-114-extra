@@ -232,6 +232,7 @@ void BuildExtensionsList() {
 const GLubyte *gl4es_glGetString(GLenum name) {
     DBG(printf("glGetString(%s)\n", PrintEnum(name));)
     errorShim(GL_NO_ERROR);
+    /*
     switch (name) {
         case GL_VERSION:
             return (GLubyte *)globals4es.version;
@@ -257,7 +258,9 @@ const GLubyte *gl4es_glGetString(GLenum name) {
             }
 			errorShim(GL_INVALID_ENUM);
             return (GLubyte*)"";
-    }
+    }*/
+    LOAD_GLES2_(glGetString);
+    return gles_glGetString(name);
 }
 //const GLubyte *glGetString(GLenum name) AliasExport("gl4es_glGetString");
 
