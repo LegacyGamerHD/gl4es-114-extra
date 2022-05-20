@@ -1,7 +1,7 @@
 ![logo](gl4es.png "gl4es logo")
 
 GL4ES - OpenGL for GLES Hardware
-====
+==== 
 
 ![gl4es build status](https://api.travis-ci.org/ptitSeb/gl4es.png "gl4es build status")
 
