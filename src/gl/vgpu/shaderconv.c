@@ -1,21 +1,45 @@
 //
 // Created by serpentspirale on 13/01/2022.
 //
-
+#include <math.h>
 #include <string.h>
-#include <malloc.h>
+#include <stdlib.h>
 #include "shaderconv.h"
 #include "../string_utils.h"
 #include "../logs.h"
 #include "../const.h"
-
-// Version expected to be replaced
-char * old_version = "#version 120";
-// The version we will declare as
-//char * new_version = "#version 450 compatibility";
-char * new_version = "#version 320 es\n";
+#include "../../glx/hardext.h"
+#include "../shaderconv.h"
 
 int NO_OPERATOR_VALUE = 9999;
+
+/**
+ * Makes more and more destructive conversions to make the shader compile
+ * @return The shader as a string
+ */
+char * ConvertShaderConditionally(struct shader_s * shader_source){
+    int shaderCompileStatus;
+
+    // First, vanilla gl4es, no forward port
+    shader_source->converted = ConvertShader(shader_source->source, shader_source->type == GL_VERTEX_SHADER ? 1 : 0,&shader_source->need, 0);
+    shaderCompileStatus = testGenericShader(shader_source);
+
+    // Then, attempt back porting if desired of constrained to do so
+    if(!shaderCompileStatus && globals4es.vgpu_backport) {
+        shader_source->converted = ConvertShader(shader_source->source, shader_source->type == GL_VERTEX_SHADER ? 1 : 0,&shader_source->need, 0);
+        shader_source->converted = ConvertShaderVgpu(shader_source);
+        shaderCompileStatus = testGenericShader(shader_source);
+    }
+
+    // At last resort, use forward porting
+    if(!shaderCompileStatus && hardext.glsl300es){
+        shader_source->converted = ConvertShader(shader_source->source, shader_source->type == GL_VERTEX_SHADER ? 1 : 0, &shader_source->need, 1);
+        shader_source->converted = ConvertShaderVgpu(shader_source);
+    }
+
+    return shader_source->converted;
+}
+
 
 /** Convert the shader through multiple steps
  * @param source The start of the shader as a string*/
@@ -29,11 +53,39 @@ char * ConvertShaderVgpu(struct shader_s * shader_source){
     char * source = shader_source->converted;
     int sourceLength = strlen(source) + 1;
 
-    // TODO Deal with lower versions ?
     // For now, skip stuff
-    if(!globals4es.vgpu_force_conv && FindString(source, "#version 100")){
-        if (globals4es.vgpu_dump) {
-            printf("OLD VERSION, SKIPPING !\n");
+    if(FindString(source, "#version 100")){
+        if(globals4es.vgpu_force_conv || globals4es.vgpu_backport){
+            if (shader_source->type == GL_VERTEX_SHADER){
+                source = ReplaceVariableName(source, &sourceLength, "in", "attribute");
+                source = ReplaceVariableName(source, &sourceLength, "out", "varying");
+            }else{
+                source = ReplaceVariableName(source, &sourceLength, "in", "varying");
+                source = ReplaceFragmentOut(source, &sourceLength);
+            }
+
+            // Well, we don't have gl_VertexID on OPENGL 1
+            source = ReplaceVariableName(source, &sourceLength, "gl_VertexID", "0");
+            source = InplaceReplaceSimple(source, &sourceLength, "ivec", "vec");
+            source = InplaceReplaceSimple(source, &sourceLength, "bvec", "vec");
+            source = InplaceReplaceSimple(source, &sourceLength, "flat ", "");
+
+            source = BackportConstArrays(source, &sourceLength);
+            int insertPoint = FindPositionAfterVersion(source);
+            source = InplaceInsertByIndex(source, &sourceLength, insertPoint + 1, "#define texelFetch(a, b, c) vec4(1.0,1.0,1.0,1.0) \n");
+
+            source = ReplaceModOperator(source, &sourceLength);
+
+            if (globals4es.vgpu_dump){
+                printf("New VGPU Shader conversion:\n%s\n", source);
+            }
+
+            return source;
+        }
+
+        // Else, skip the conversion
+        if (globals4es.vgpu_dump){
+            printf("SKIPPING OLD SHADER CONVERSION \n");
         }
         return source;
     }
@@ -54,6 +106,7 @@ char * ConvertShaderVgpu(struct shader_s * shader_source){
     source = ReplaceVariableName(source, &sourceLength, "texture", "vgpu_texture");
 
     source = ReplaceFunctionName(source, &sourceLength, "texture2D", "texture");
+    source = ReplaceFunctionName(source, &sourceLength, "texture2DLod", "textureLod");
 
 
     //printf("REMOVING \" CHARS ");
@@ -106,13 +159,186 @@ char * ConvertShaderVgpu(struct shader_s * shader_source){
     }
 
     //printf("FUCKING UP PRECISION");
-    source = ReplacePrecisionQualifiers(source, &sourceLength);
+    source = ReplacePrecisionQualifiers(source, &sourceLength, shader_source->type == GL_VERTEX_SHADER);
 
     if (globals4es.vgpu_dump){
         printf("New VGPU Shader conversion:\n%s\n", source);
     }
 
     return source;
+}
+
+/**
+ * Turn const arrays and its accesses into a function and function calls
+ * @param source The shader as a string
+ * @param sourceLength The shader allocated length
+ * @return The shader as a string, maybe in a different memory location
+ */
+char * BackportConstArrays(char *source, int * sourceLength){
+    unsigned long startPoint = strstrPos(source, "const");
+    if(startPoint == 0){
+        return source;
+    }
+    int constStart, constStop;
+    GetNextWord(source, startPoint, &constStart, &constStop); // Catch the "const"
+
+    int typeStart, typeStop;
+    GetNextWord(source, constStop, &typeStart, &typeStop); // Catch the type, without []
+
+    int variableNameStart, variableNameStop;
+    GetNextWord(source, typeStop, &variableNameStart, &variableNameStop); // Catch the var name
+    char * variableName = ExtractString(source, variableNameStart, variableNameStop);
+
+    //Now, verify the data type is actually an array
+    char * tokenStart = strstr(source + typeStop, "[");
+    if( tokenStart != NULL && (tokenStart - source) < variableNameStart){
+        // We've found an array. So we need to get to the starting parenthesis and isolate each member
+        int startArray = GetNextTokenPosition(source, variableNameStop, '(', "");
+        int endArray = GetClosingTokenPosition(source, startArray);
+
+        // First pass, to count the amount of entries in the array
+        int arrayEntryCount = -1;
+        int currentPoint = startArray;
+        while (currentPoint < endArray){
+            ++arrayEntryCount;
+            currentPoint = GetClosingTokenPositionTokenOverride(source, currentPoint, ',');
+        }
+        if(currentPoint == endArray){
+            ++arrayEntryCount;
+        }
+
+        // Now we know how many entries we have, we can copy data
+        int entryStart = startArray + 1;
+        int entryEnd;
+        for(int j=0; j<arrayEntryCount; ++j){
+            // First, isolate the array entry
+            entryEnd = GetClosingTokenPositionTokenOverride(source, entryStart, ',');
+
+            // Replace the entry and jump to the end of the replacement
+            source = InplaceReplaceByIndex(source, sourceLength, entryEnd , entryEnd +1, ";}"); // +2 - 1
+            // Build the string to insert
+            int indexStringLength = (j == 0 ? 1 : (int)(log10(j)+1));
+            char * replacementString = malloc(19 + indexStringLength + 1);
+            replacementString[19 + indexStringLength + 1] = '\0';
+            memcpy(replacementString, "if(index==", 10);
+            sprintf(replacementString + 10, "%d", j);
+            strcpy(replacementString + 10 + indexStringLength, "){return ");
+
+            // Insert the correct index in the replacement string
+            source = InplaceInsertByIndex(source, sourceLength, entryStart, replacementString);
+
+            entryStart = entryEnd + 19 + indexStringLength + 2;
+            free(replacementString);
+        }
+
+        // The replacement string is not needed anymore
+
+
+        // Add The last "}" to close the function
+        source = InplaceInsertByIndex(source, sourceLength, entryStart, "}");
+        // Add the argument section of the function
+        source = InplaceReplaceByIndex(source, sourceLength, variableNameStop, startArray , "(int index){");
+        // Remove the []
+        source = InplaceReplaceByIndex(source, sourceLength, typeStop, variableNameStart - 1, " ");
+        // Finally, remove the "const" keyword
+        source = InplaceReplaceByIndex(source, sourceLength, startPoint, startPoint + 5, " ");
+
+        // Now, we have to turn every array access to a function call
+        // TODO change the start position to be more accurate to the end of the function !
+        for(int k = strstrPos(source + endArray, variableName) + endArray; k < strlen(source); ){
+            int startAccess = GetNextTokenPosition(source, k, '[', "");
+            int endAccess = GetClosingTokenPosition(source, startAccess);
+            source = InplaceReplaceByIndex(source, sourceLength, endAccess, endAccess, ")");
+            source = InplaceReplaceByIndex(source, sourceLength, startAccess, startAccess, "(");
+
+            int nextPos = strstrPos(source + k, variableName) + k;
+            if(nextPos == k) break;
+            k = nextPos;
+        }
+
+        free(variableName);
+
+    }else{
+        // Nothing, go to the next loop iteration
+    }
+
+    return source;
+}
+
+/**
+ * Extract a substring from the provided string
+ * @param source The shader as a string
+ * @param startString The start of the substring
+ * @param endString The end of the substring
+ * @return A newly allocated substring. Don't forget to free() it !
+ */
+char * ExtractString(char * source, int startString, int endString){
+    char * subString = malloc((endString - startString) +1);
+    subString[(endString - startString) +1] = '\0';
+    memcpy(subString, source + startString, (endString - startString));
+    return subString;
+}
+
+/**
+ * Replace the out vec4 from a fragment shader by the gl_FragColor constant
+ * @param source The shader as a string
+ * @return The shader, maybe in a different memory location
+ */
+char * ReplaceFragmentOut(char * source, int *sourceLength){
+    int startPosition = strstrPos(source, "out");
+    if(startPosition == 0) return source; // No "out" keyword
+    int t1, t2;
+    GetNextWord(source, startPosition, &t1, &t2); // Catches "out"
+    GetNextWord(source, t2, &t1, &t2); // Catches "vec4"
+    GetNextWord(source, t2, &t1, &t2); // Catches the variableName
+
+    // Load the variable inside another string
+    char * variableName = malloc(t2 - t1 + 1);
+    variableName[t2 - t1 + 1] = '\0';
+    memcpy(variableName, source + t1, t2 - t1);
+
+    // Removing the declaration
+    source = InplaceReplaceByIndex(source, sourceLength, startPosition, t2 + 1, "");
+
+    // Replacing occurrences of the variable
+    source = ReplaceVariableName(source, sourceLength, variableName, "gl_FragColor");
+
+    free(variableName);
+
+    return source;
+}
+
+/**
+ * Get to the start, then end of the next of current word.
+ * @param source The shader as a string
+ * @param startPoint The start point to look at
+ * @param startWord Will point to the start of the word
+ * @param endWord Will point to the end of the word
+ */
+void GetNextWord(char *source, int startPoint, int * startWord, int * endWord){
+    // Step 1: Find the real start point
+    int start = 0;
+    while(!start){
+        if(isValidFunctionName(source[startPoint] ) || isDigit(source[startPoint])){
+            start = startPoint;
+            break;
+        }
+        ++startPoint;
+    }
+
+    // Step 2: Find the end of a word
+    int end = 0;
+    while (!end){
+        if(!isValidFunctionName(source[startPoint] ) && !isDigit(source[startPoint])){
+            end = startPoint;
+            break;
+        }
+        ++startPoint;
+    }
+
+    // Then return values
+    *startWord = start;
+    *endWord = end;
 }
 
 char * InsertExtensions(char *source, int *sourceLength){
@@ -134,10 +360,7 @@ char * InsertExtension(char * source, int * sourceLength, const int insertPoint,
 }
 
 int doesShaderVersionContainsES(const char * source){
-    if(FindString(source, "#version 300 es") || FindString(source, "#version 310 es") || FindString(source, "#version 320 es")){
-        return 1;
-    }
-    return 0;
+    return GetShaderVersion(source) >= 300;
 }
 
 char * WrapIvecFunctions(char * source, int * sourceLength){
@@ -147,8 +370,8 @@ char * WrapIvecFunctions(char * source, int * sourceLength){
                                                                                  "#ifdef GL_EXT_texture_buffer\n"
                                                                                  "vec4 vgpu_texelFetch(samplerBuffer sampler, float P){return texelFetch(sampler, int(P));}\n"
                                                                                  "#endif\n"
-                                                                                 "vec4 vgpu_texelFetch(sampler2DMS sampler, vec2 P, float _sample){return texelFetch(sampler, ivec2(int(P.x), int(P.y)), int(_sample));}\n"
                                                                                  "#ifdef GL_OES_texture_storage_multisample_2d_array\n"
+                                                                                 "vec4 vgpu_texelFetch(sampler2DMS sampler, vec2 P, float _sample){return texelFetch(sampler, ivec2(int(P.x), int(P.y)), int(_sample));}\n"
                                                                                  "vec4 vgpu_texelFetch(sampler2DMSArray sampler, vec3 P, float _sample){return texelFetch(sampler, ivec3(int(P.x), int(P.y), int(P.z)), int(_sample));}\n"
                                                                                  "#endif\n");
 
@@ -166,19 +389,19 @@ char * WrapIvecFunctions(char * source, int * sourceLength){
                                                                                    "#ifdef GL_EXT_texture_buffer\n"
                                                                                    "float vgpu_textureSize(samplerBuffer sampler){return float(textureSize(sampler));}\n"
                                                                                    "#endif\n"
-                                                                                   "vec2 vgpu_textureSize(sampler2DMS sampler){ivec2 size = textureSize(sampler);return vec2(size.x, size.y);}\n"
                                                                                    "#ifdef GL_OES_texture_storage_multisample_2d_array\n"
+                                                                                   "vec2 vgpu_textureSize(sampler2DMS sampler){ivec2 size = textureSize(sampler);return vec2(size.x, size.y);}\n"
                                                                                    "vec3 vgpu_textureSize(sampler2DMSArray sampler){ivec3 size = textureSize(sampler);return vec3(size.x, size.y, size.z);}\n"
                                                                                    "#endif\n");
 
-    source = WrapFunction(source, sourceLength, "textureOffset", "vgpu_textureOffset", "\nvec4 vgpu_textureOffset(sampler2D sampler, vec2 P, vec2 offset){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)));}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler2D sampler, vec2 P, vec2 offset, float bias){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)), bias);}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler3D sampler, vec3 P, vec3 offset){return textureOffset(sampler, P, ivec3(int(offset.x), int(offset.y), int(offset.y)));}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler3D sampler, vec3 P, vec3 offset, float bias){return textureOffset(sampler, P, ivec3(int(offset.x), int(offset.y), int(offset.x)), bias);}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler2DShadow sampler, vec3 P, vec2 offset){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)));}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler2DShadow sampler, vec3 P, vec2 offset, float bias){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)), bias);}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler2DArray sampler, vec3 P, vec2 offset){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)));}\n"
-                                                                                       "vec4 vgpu_textureOffset(sampler2DArray sampler, vec3 P, vec2 offset, float bias){return textureOffset(sampler, P, ivec2(int(offset.x), int(offset.y)), bias);}\n");
+    source = WrapFunction(source, sourceLength, "textureOffset", "vgpu_textureOffset", "\nvec4 vgpu_textureOffset(sampler2D tex, vec2 P, vec2 offset, float bias){ivec2 Size = textureSize(tex, 0);return texture(tex, P+offset/vec2(float(Size.x), float(Size.y)), bias);}\n"
+                                                                                       "vec4 vgpu_textureOffset(sampler2D tex, vec2 P, vec2 offset){return vgpu_textureOffset(tex, P, offset, 0.0);}\n"
+                                                                                       "vec4 vgpu_textureOffset(sampler3D tex, vec3 P, vec3 offset, float bias){ivec3 Size = textureSize(tex, 0);return texture(tex, P+offset/vec3(float(Size.x), float(Size.y), float(Size.z)), bias);}\n"
+                                                                                       "vec4 vgpu_textureOffset(sampler3D tex, vec3 P, vec3 offset){return vgpu_textureOffset(tex, P, offset, 0.0);}\n"
+                                                                                       "float vgpu_textureOffset(sampler2DShadow tex, vec3 P, vec2 offset, float bias){ivec2 Size = textureSize(tex, 0);return texture(tex, P+vec3(offset.x, offset.y, 0)/vec3(float(Size.x), float(Size.y), 1.0), bias);}\n"
+                                                                                       "float vgpu_textureOffset(sampler2DShadow tex, vec3 P, vec2 offset){return vgpu_textureOffset(tex, P, offset, 0.0);}\n"
+                                                                                       "vec4 vgpu_textureOffset(sampler2DArray tex, vec3 P, vec2 offset, float bias){ivec3 Size = textureSize(tex, 0);return texture(tex, P+vec3(offset.x, offset.y, 0)/vec3(float(Size.x), float(Size.y), float(Size.z)), bias);}\n"
+                                                                                       "vec4 vgpu_textureOffset(sampler2DArray tex, vec3 P, vec2 offset){return vgpu_textureOffset(tex, P, offset, 0.0);}\n");
 
     source = WrapFunction(source, sourceLength, "shadow2D", "vgpu_shadow2D", "\nvec4 vgpu_shadow2D(sampler2DShadow shadow, vec3 coord){return vec4(texture(shadow, coord), 0.0, 0.0, 0.0);}\n"
                                                                               "vec4 vgpu_shadow2D(sampler2DShadow shadow, vec3 coord, float bias){return vec4(texture(shadow, coord, bias), 0.0, 0.0, 0.0);}\n");
@@ -759,7 +982,14 @@ int FindPositionAfterVersion(char * source){
  * @param sourceLength The length of the string
  * @return The shader as a string, maybe in a different memory location
  */
-char * ReplacePrecisionQualifiers(char * source, int * sourceLength){
+char * ReplacePrecisionQualifiers(char * source, int * sourceLength, int isVertex){
+
+    if(!doesShaderVersionContainsES(source)){
+        if (globals4es.vgpu_dump) {
+            printf("\nSKIPPING the replacement qualifiers step\n");
+        }
+        return source;
+    }
 
     // Step 1 is to remove any "precision" qualifiers
     for(unsigned long currentPosition=strstrPos(source, "precision "); currentPosition>0;currentPosition=strstrPos(source, "precision ")){
@@ -772,19 +1002,13 @@ char * ReplacePrecisionQualifiers(char * source, int * sourceLength){
 
     int insertPoint = FindPositionAfterDirectives(source);
     source = InplaceInsertByIndex(source, sourceLength, insertPoint,
-                                   "\nprecision lowp float;\n"
-                                   "precision lowp sampler2D;\n"
+                                   "\nprecision lowp sampler2D;\n"
                                    "precision lowp sampler3D;\n"
                                    "precision lowp sampler2DShadow;\n"
                                    "precision lowp samplerCubeShadow;\n"
                                    "precision lowp sampler2DArray;\n"
                                    "precision lowp sampler2DArrayShadow;\n"
-                                   "precision lowp sampler2DMS;\n"
                                    "precision lowp samplerCube;\n"
-                                   "precision lowp image2D;\n"
-                                   "precision lowp image2DArray;\n"
-                                   "precision lowp image3D;\n"
-                                   "precision lowp imageCube;\n"
                                    "#ifdef GL_EXT_texture_buffer\n"
                                    "precision lowp samplerBuffer;\n"
                                    "precision lowp imageBuffer;\n"
@@ -795,10 +1019,19 @@ char * ReplacePrecisionQualifiers(char * source, int * sourceLength){
                                    "precision lowp samplerCubeArrayShadow;\n"
                                    "#endif\n"
                                    "#ifdef GL_OES_texture_storage_multisample_2d_array\n"
+                                   "precision lowp sampler2DMS;\n"
                                    "precision lowp sampler2DMSArray;\n"
                                    "#endif\n");
 
-
+    if(GetShaderVersion(source) > 300){
+        source = InplaceInsertByIndex(source, sourceLength,insertPoint,
+                                      "\nprecision lowp image2D;\n"
+                                      "precision lowp image2DArray;\n"
+                                      "precision lowp image3D;\n"
+                                      "precision lowp imageCube;\n");
+    }
+    int supportHighp = ((isVertex || hardext.highp) ? 1 : 0);
+    source = InplaceInsertByIndex(source, sourceLength, insertPoint, supportHighp ? "\nprecision highp float;\n" : "\nprecision medium float;\n");
 
     if (globals4es.vgpu_precision != 0){
         char * target_precision;
@@ -826,6 +1059,7 @@ char * GetClosingTokens(char openingToken){
         case '[': return "]";
         case ',': return ",)";
         case '{': return "}";
+        case ';': return ";";
 
         default: return "";
     }
@@ -836,7 +1070,7 @@ char * GetClosingTokens(char openingToken){
  * @return Whether the token is an opening token
  */
 int isOpeningToken(char openingToken){
-    return strlen(GetClosingTokens(openingToken)) != 0;
+    return openingToken != ',' && strlen(GetClosingTokens(openingToken)) != 0;
 }
 
 int GetClosingTokenPosition(const char * source, int initialTokenPosition){
@@ -853,8 +1087,11 @@ int GetClosingTokenPositionTokenOverride(const char * source, int initialTokenPo
     // Step 1: Determine the closing token
     char openingToken = initialToken;
     char * closingTokens = GetClosingTokens(openingToken);
-
-    if (strlen(closingTokens) == 0) return initialTokenPosition;
+    printf("Closing tokens: %s", closingTokens);
+    if (strlen(closingTokens) == 0){
+        printf("No closing tokens, somehow \n");
+        return initialTokenPosition;
+    }
 
     // Step 2: Go through the string to find what we want
     for(int i=initialTokenPosition+1; i<strlen(source); ++i){
@@ -870,6 +1107,7 @@ int GetClosingTokenPositionTokenOverride(const char * source, int initialTokenPo
             continue;
         }
     }
+    printf("No closing tokens 2 , somehow \n");
     return initialTokenPosition; // Nothing found
 }
 
@@ -948,4 +1186,19 @@ char * insertIntAtFunctionCall(char * source, int * sourceSize, const char * fun
         functionCallPosition += offset + strlen(functionName);
     }
     return source;
+}
+
+/**
+ * @param source The shader as a string
+ * @return The shader version: eg. 310 for #version 310 es
+ */
+int GetShaderVersion(const char * source){
+    // Oh yeah, I won't care much about this function
+    if(FindString(source, "#version 320 es")){return 320;}
+    if(FindString(source, "#version 310 es")){return 310;}
+    if(FindString(source, "#version 300 es")){return 300;}
+    if(FindString(source, "#version 150")){return 150;}
+    if(FindString(source, "#version 130")){return 130;}
+    if(FindString(source, "#version 120")){return 120;}
+    return 100;
 }
